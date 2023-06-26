@@ -4,15 +4,21 @@
 //!
 //! WIP
 
+use core::panic;
 use futures::Future;
 use leptos::{
     create_runtime,
     leptos_server::server_fn_by_path,
     provide_context, raw_scope_and_disposer,
     server_fn::{Encoding, Payload},
-    use_context,
+    use_context, IntoView, LeptosOptions,
 };
-use worker::{Headers, Request, Response, ResponseBody};
+use leptos_router::Method;
+use parking_lot::RwLock;
+use std::sync::Arc;
+use worker::{
+    Headers, Request, Response, ResponseBody, Result as WorkerResult,
+};
 
 /// This struct lets you define headers and override the status of the Response from an Element or a Server Function
 /// Typically contained inside of a ResponseOptions. Setting this is useful for cookies and custom responses.
@@ -54,18 +60,18 @@ impl ResponseOptions {
     /// Insert a header, overwriting any previous value with the same key
     pub fn insert_header(
         &self,
-        key: header::HeaderName,
-        value: header::HeaderValue,
+        key: &str,
+        value: &str,
     ) {
         let mut writeable = self.0.write();
         let res_parts = &mut *writeable;
-        res_parts.headers.insert(key, value);
+        res_parts.headers.set(key, value);
     }
     /// Append a header, leaving any header with the same key intact
     pub fn append_header(
         &self,
-        key: header::HeaderName,
-        value: header::HeaderValue,
+        key: &str,
+        value: &str,
     ) {
         let mut writeable = self.0.write();
         let res_parts = &mut *writeable;
@@ -93,10 +99,14 @@ pub fn redirect(cx: leptos::Scope, path: &str) {
 /// This function always provides context values including the following types:
 /// - [ResponseOptions]
 /// - [Request](worker::Request)
-pub async fn handle_server_fns(req: Request, ctx: worker::RouteContext<D>) -> T
-where
-    T: Future<Output = Result<Response>> + 'a,
-{
+pub async fn handle_server_fns<
+    'a,
+    // T: Future<Output = WorkerResult<Response>> + 'a,
+    D,
+>(
+    req: Request,
+    ctx: worker::RouteContext<D>,
+) -> impl Future<Output = WorkerResult<Response>> {
     handle_server_fns_with_context(req, ctx, |_cx| {})
 }
 
@@ -115,195 +125,246 @@ where
 /// This function always provides context values including the following types:
 /// - [ResponseOptions]
 /// - [Request](worker::Request)
-pub fn handle_server_fns_with_context(
+pub fn handle_server_fns_with_context<
+    'a,
+    // T: Future<Output = WorkerResult<Response>> + 'a,
+    D,
+>(
     req: Request,
     ctx: worker::RouteContext<D>,
     additional_context: impl Fn(leptos::Scope) + 'static + Clone + Send,
-) -> T
-where
-    T: Future<Output = Result<Response>> + 'a,
-{
-    let url = if let Ok(u) = req.url() {
-        u
-    }; //how to deal with errors in here?
+) -> impl Future<Output = WorkerResult<Response>> {
+    let url = match req.url() {
+        Ok(u) => u,
+        _ => {
+            panic!("Failed to get URL from request"); //how to deal with errors in here?
+        }
+    };
 
     async move {
-        if let Some(server_fn) = server_fn_by_path(
-            url.path().strip_prefix('/').unwrap_or(url.path()),
-        ) {
-            let runtime = create_runtime();
-            let (cx, disposer) = raw_scope_and_disposer(runtime);
+        Ok(
+            if let Some(server_fn) = server_fn_by_path(
+                url.path().strip_prefix('/').unwrap_or(url.path()),
+            ) {
+                let runtime = create_runtime();
+                let (cx, disposer) = raw_scope_and_disposer(runtime);
 
-            additional_context(cx);
+                additional_context(cx);
 
-            provide_context(cx, req.clone());
-            provide_context(cx, ResponseOptions::default());
+                // provide_context(cx, req); //request doesn't implement clone...
+                provide_context(cx, ResponseOptions::default());
 
-            let query = url.query().unwrap_or("");
-            let data = match &server_fn.encoding() {
-                Encoding::Url | Encoding::Cbor => {
-                    &req.bytes().await.unwrap_or_default()
-                }
-                Encoding::GetJSON | Encoding::GetCBOR => query,
-            };
-            let res = match server_fn.call(cx, data).await {
-                Ok(serialized) => {
-                    // If ResponseOptions are set, add the headers and status to the request
-                    let res_options = use_context::<ResponseOptions>(cx);
-
-                    let res_parts = res_options.0.write();
-
-                    // if this is Accept: application/json then send a serialized JSON response
-                    let accept_header = headers
-                        .get("Accept")
-                        .and_then(|value| value.to_str().ok());
-
-                    let mut res_status: u16 = 0;
-                    let mut headers = Headers::new();
-
-                    if accept_header == Some("application/json")
-                        || accept_header
-                            == Some("application/x-www-form-urlencoded")
-                        || accept_header == Some("application/cbor")
-                    {
-                        res_status = 200;
+                let query = url.query().unwrap_or("");
+                let data = match &server_fn.encoding() {
+                    Encoding::Url | Encoding::Cbor => {
+                        req.clone_mut()
+                            .expect("Could not mutably clone request")
+                            .bytes()
+                            .await
+                            .unwrap_or_default() //TODO better error handling?
                     }
-                    // otherwise, it's probably a <form> submit or something: redirect back to the referrer
-                    else {
-                        let referer = req
-                            .headers()
-                            .get("Referer")
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or("/");
-                        res_status = 303;
-                        headers.set("Location", referer);
-                    };
-                    // Override StatusCode if it was set in a Resource or Element
-                    if let Some(status) = res_parts.status {
-                        res_status = status;
+                    Encoding::GetJSON | Encoding::GetCBOR => {
+                        Vec::from(query.as_bytes())
                     }
+                };
+                let res = match server_fn.call(cx, &data).await {
+                    Ok(serialized) => {
+                        // If ResponseOptions are set, add the headers and status to the request
+                        let res_options =
+                            use_context::<ResponseOptions>(cx).unwrap();
 
-                    res_parts
-                        .headers
-                        .entries()
-                        .map(|(k, v)| headers.append(k, v));
+                        let res_parts = res_options.0.write();
 
-                    match serialized {
-                        Payload::Binary(data) => {
-                            if let Ok(r) =
-                                Response::from_body(ResponseBody::Body(data))
-                            {
-                                r.with_headers(headers).with_status(status)
+                        // if this is Accept: application/json then send a serialized JSON response
+                        let accept_header = match req.headers().get("Accept") {
+                            Ok(o) => o,
+                            _ => None,
+                        };
+                        
+
+                        let mut res_status: u16 = 0;
+                        let mut headers = Headers::new();
+
+                        if accept_header == Some("application/json".to_string())
+                            || accept_header
+                                == Some("application/x-www-form-urlencoded".to_string())
+                            || accept_header == Some("application/cbor".to_string())
+                        {
+                            res_status = 200;
+                        }
+                        // otherwise, it's probably a <form> submit or something: redirect back to the referrer
+                        else {
+                            let referer = match req.headers().get("Referer") {
+                                Ok(Some(value)) => value,
+                                _ => "/".to_string(),
+                            };
+                            res_status = 303;
+                            headers.set("Location", &referer);
+                        };
+                        // Override StatusCode if it was set in a Resource or Element
+                        if let Some(status) = res_parts.status {
+                            res_status = status;
+                        }
+
+                        res_parts
+                            .headers
+                            .entries()
+                            .map(|(k, v)| headers.append(&k, &v));
+
+                        match serialized {
+                            Payload::Binary(data) => {
+                                match Response::from_body(ResponseBody::Body(
+                                    data,
+                                )) {
+                                    Ok(r) => r
+                                        .with_headers(headers)
+                                        .with_status(res_status),
+                                    _ => Response::empty()
+                                        .unwrap()
+                                        .with_status(500), //unwrap
+                                }
+                            }
+                            Payload::Url(data) => {
+                                match Response::from_body(ResponseBody::Body(
+                                    data.into_bytes(),
+                                )) {
+                                    Ok(r) => {
+                                        headers.set(
+                                            "Content-Type",
+                                            "application/\
+                                             x-www-form-urlendcoded",
+                                        );
+                                        r.with_headers(headers)
+                                            .with_status(res_status)
+                                    }
+                                    _ => Response::empty()
+                                        .unwrap()
+                                        .with_status(500), //unwrap
+                                }
+                            }
+                            Payload::Json(data) => {
+                                match Response::from_body(ResponseBody::Body(
+                                    data.into_bytes(),
+                                )) {
+                                    Ok(r) => {
+                                        headers.set(
+                                            "Content-Type",
+                                            "application/json",
+                                        );
+                                        r.with_headers(headers)
+                                            .with_status(res_status)
+                                    }
+                                    _ => Response::empty()
+                                        .unwrap()
+                                        .with_status(500), //unwrap
+                                }
                             }
                         }
-                        Payload::Url(data) => {
-                            if let Ok(r) = Response::from_body(
-                                ResponseBody::Body(data.into_bytes()),
-                            ) {
-                                headers.set(
-                                    "Content-Type",
-                                    "application/x-www-form-urlendcoded",
-                                );
-                                r.with_headers(headers).with_status(status_code)
-                            }
-                        }
-                        Payload::Json(data) => {
-                            if let Ok(r) = Response::from_body(
-                                ResponseBody::Body(data.into_bytes()),
-                            ) {
-                                headers.set("Content-Type", "application/json");
-                                r.with_headers(headers).with_status(status_code)
-                            }
+                    }
+                    Err(e) => {
+                        match Response::from_body(ResponseBody::Body(
+                            serde_json::to_string(&e)
+                                .unwrap_or_else(|_| e.to_string())
+                                .into_bytes(),
+                        )) {
+                            Ok(r) => r.with_status(500),
+                            _ => Response::empty().unwrap().with_status(500), /* unwrap */
                         }
                     }
+                };
+                // clean up the scope
+                disposer.dispose();
+                runtime.dispose();
+                res
+            } else {
+                match Response::from_body(ResponseBody::Body(
+                    format!(
+                        "Could not find a server function at the route {:?}. \
+                         \n\nIt's likely that you need to call \
+                         ServerFn::register_explicit() on the server function \
+                         type, somewhere in your `main` function.",
+                        url.path()
+                    )
+                    .into_bytes(),
+                )) {
+                    Ok(r) => r.with_status(400),
+                    _ => Response::empty().unwrap().with_status(400), // unwrap
                 }
-                Err(e) => {
-                    if let Ok(r) = Response::from_body(ResponseBody::Body(
-                        serde_json::to_string(&e)
-                            .unwrap_or_else(|_| e.to_string())
-                            .into_bytes(),
-                    )) {
-                        r.with_status(500)
-                    }
-                }
-            };
-            // clean up the scope
-            disposer.dispose();
-            runtime.dispose();
-            res
-        } else {
-            if let Ok(r) = Response::from_body(ResponseBody::Body(
-                format!(
-                    "Could not find a server function at the route {:?}. \
-                     \n\nIt's likely that you need to call \
-                     ServerFn::register_explicit() on the server function \
-                     type, somewhere in your `main` function.",
-                    url.path()
-                )
-                .into_bytes(),
-            )) {
-                r.with_status(400)
-            }
-        }
+            },
+        )
     }
 }
 
-pub fn render_app_to_stream<IV>(
-    options: LeptosOptions,
-    app_fn: impl Fn(leptos::Scope) -> IV + Clone + 'static,
-    method: Method,
-) -> T
-where
-    T: Future<Output = Result<Response>> + 'a,
-    IV: IntoView,
-{
-    render_app_to_stream_with_context(options, |_cx| {}, app_fn, method)
-}
+// pub fn render_app_to_stream<IV>(
+//     options: LeptosOptions,
+//     app_fn: impl Fn(leptos::Scope) -> IV + Clone + 'static,
+//     method: Method,
+// ) -> T
+// where
+//     T: Future<Output = Result<Response>> + 'a,
+//     IV: IntoView,
+// {
+//     render_app_to_stream_with_context(options, |_cx| {}, app_fn, method)
+// }
 
-pub fn render_app_to_stream_in_order<IV>(
-    options: LeptosOptions,
-    app_fn: impl Fn(leptos::Scope) -> IV + Clone + 'static,
-    method: Method,
-) -> T
-where
-    T: Future<Output = Result<Response>> + 'a,
-    IV: IntoView,
-{
-    render_app_to_stream_in_order_with_context(
-        options,
-        |_cx| {},
-        app_fn,
-        method,
-    )
-}
+// pub fn render_app_to_stream_in_order<IV>(
+//     options: LeptosOptions,
+//     app_fn: impl Fn(leptos::Scope) -> IV + Clone + 'static,
+//     method: Method,
+// ) -> T
+// where
+//     T: Future<Output = Result<Response>> + 'a,
+//     IV: IntoView,
+// {
+//     render_app_to_stream_in_order_with_context(
+//         options,
+//         |_cx| {},
+//         app_fn,
+//         method,
+//     )
+// }
 
-pub fn render_app_async<IV>(
-    options: LeptosOptions,
-    app_fn: impl Fn(leptos::Scope) -> IV + Clone + 'static,
-    method: Method,
-) -> T
-where
-    T: Future<Output = Result<Response>> + 'a,
-    IV: IntoView,
-{
-    render_app_async_with_context(options, |_cx| {}, app_fn, method)
-}
+// pub fn render_app_async<IV>(
+//     options: LeptosOptions,
+//     app_fn: impl Fn(leptos::Scope) -> IV + Clone + 'static,
+//     method: Method,
+// ) -> T
+// where
+//     T: Future<Output = Result<Response>> + 'a,
+//     IV: IntoView,
+// {
+//     render_app_async_with_context(options, |_cx| {}, app_fn, method)
+// }
 
-pub fn render_app_to_stream_with_context<IV>(
-    options: LeptosOptions,
-    additional_context: impl Fn(leptos::Scope) + 'static + Clone + Send,
-    app_fn: impl Fn(leptos::Scope) -> IV + Clone + 'static,
-    method: Method,
-) -> T
-where
-    T: Future<Output = Result<Response>> + 'a,
-    IV: IntoView,
-{
-    render_app_to_stream_with_context_and_replace_blocks(
-        options,
-        additional_context,
-        app_fn,
-        method,
-        false,
-    )
-}
+// pub fn render_app_to_stream_with_context<IV>(
+//     options: LeptosOptions,
+//     additional_context: impl Fn(leptos::Scope) + 'static + Clone + Send,
+//     app_fn: impl Fn(leptos::Scope) -> IV + Clone + 'static,
+//     method: Method,
+// ) -> T
+// where
+//     T: Future<Output = Result<Response>> + 'a,
+//     IV: IntoView,
+// {
+//     render_app_to_stream_with_context_and_replace_blocks(
+//         options,
+//         additional_context,
+//         app_fn,
+//         method,
+//         false,
+//     )
+// }
+
+// pub fn render_app_to_stream_with_context_and_replace_blocks<IV>(
+//     options: LeptosOptions,
+//     additional_context: impl Fn(leptos::Scope) + 'static + Clone + Send,
+//     app_fn: impl Fn(leptos::Scope) -> IV + Clone + 'static,
+//     method: Method,
+//     replace_blocks: bool,
+// ) -> T
+// where
+//     T: Future<Output = Result<Response>> + 'a,
+//     IV: IntoView,
+// {
+
+// }
