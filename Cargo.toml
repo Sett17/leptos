@@ -17,6 +17,7 @@ members = [
   "integrations/actix",
   "integrations/axum",
   "integrations/viz",
+  "integrations/cloudflare_worker",
   "integrations/utils",
 
   # libraries
