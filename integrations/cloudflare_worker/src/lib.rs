@@ -13,12 +13,40 @@ use leptos::{
     server_fn::{Encoding, Payload},
     use_context, IntoView, LeptosOptions,
 };
-use leptos_router::Method;
+use leptos_meta::MetaContext;
+use leptos_router::{
+    provide_server_redirect, Method, RouteContext, RouterIntegrationContext,
+    ServerIntegration,
+};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use worker::{
-    Headers, Request, Response, ResponseBody, Result as WorkerResult,
+    Headers, Request, Response, ResponseBody, Result as WorkerResult, Url,
 };
+
+struct CloneableRequest(Request);
+
+impl CloneableRequest {
+    pub fn new(req: &Request) -> Self {
+        Self(match req.clone() {
+            Ok(req) => req,
+            Err(e) => panic!("Failed to clone request: {e}"),
+        })
+    }
+}
+
+impl Clone for CloneableRequest {
+    fn clone(&self) -> Self {
+        Self(match self.0.clone() {
+            Ok(req) => req,
+            Err(e) => panic!("Failed to clone request: {e}"),
+        })
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        *self = source.clone()
+    }
+}
 
 /// This struct lets you define headers and override the status of the Response from an Element or a Server Function
 /// Typically contained inside of a ResponseOptions. Setting this is useful for cookies and custom responses.
@@ -99,11 +127,7 @@ pub fn redirect(cx: leptos::Scope, path: &str) {
 /// This function always provides context values including the following types:
 /// - [ResponseOptions]
 /// - [Request](worker::Request)
-pub async fn handle_server_fns<
-    'a,
-    // T: Future<Output = WorkerResult<Response>> + 'a,
-    D,
->(
+pub async fn handle_server_fns<'a, D>(
     req: Request,
     ctx: worker::RouteContext<D>,
 ) -> impl Future<Output = WorkerResult<Response>> {
@@ -125,11 +149,7 @@ pub async fn handle_server_fns<
 /// This function always provides context values including the following types:
 /// - [ResponseOptions]
 /// - [Request](worker::Request)
-pub fn handle_server_fns_with_context<
-    'a,
-    // T: Future<Output = WorkerResult<Response>> + 'a,
-    D,
->(
+pub fn handle_server_fns_with_context<'a, D>(
     req: Request,
     ctx: worker::RouteContext<D>,
     additional_context: impl Fn(leptos::Scope) + 'static + Clone + Send,
@@ -151,7 +171,7 @@ pub fn handle_server_fns_with_context<
 
                 additional_context(cx);
 
-                // provide_context(cx, req); //request doesn't implement clone...
+                provide_context(cx, CloneableRequest::new(&req));
                 provide_context(cx, ResponseOptions::default());
 
                 let query = url.query().unwrap_or("");
@@ -180,15 +200,18 @@ pub fn handle_server_fns_with_context<
                             Ok(o) => o,
                             _ => None,
                         };
-                        
 
                         let mut res_status: u16 = 0;
                         let mut headers = Headers::new();
 
                         if accept_header == Some("application/json".to_string())
                             || accept_header
-                                == Some("application/x-www-form-urlencoded".to_string())
-                            || accept_header == Some("application/cbor".to_string())
+                                == Some(
+                                    "application/x-www-form-urlencoded"
+                                        .to_string(),
+                                )
+                            || accept_header
+                                == Some("application/cbor".to_string())
                         {
                             res_status = 200;
                         }
